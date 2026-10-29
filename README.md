@@ -21,9 +21,10 @@
 
 ### ⭐初始配置（2️⃣/3）
 
-1. 配置`gradle.properties`：
+1. 下载[模板文件](https://github.com/XColorful/TaCZ-PBK/archive/refs/heads/main.zip)（本页面的`<>Code`->`Download ZIP`）
+2. 配置`gradle.properties`：
 	- 根据文件中的注释修改相关配置
-2. 修改命名空间：
+3. 修改命名空间：
 	- 将`assets/example`、`data/example`分别重命名为`assets/{namespace}`和`data/{namespace}`
 
 ### ⭐构建方式（3️⃣/3）
@@ -76,9 +77,10 @@ A Minecraft gun pack build tool designed for [TaCZ](https://github.com/MCModderA
 
 ### ⭐ Configure the Project (2️⃣/3)
 
-1. Configure `gradle.properties`:
+1. Download the [template files](https://github.com/XColorful/TaCZ-PBK/archive/refs/heads/main.zip) (via `<>Code` -> `Download ZIP` on this page).
+2. Configure `gradle.properties`:
 	- Adjust the settings according to the comments in the file.
-2. Set the namespace:
+3. Set the namespace:
 	- Rename `assets/example` and `data/example` to `assets/{namespace}` and `data/{namespace}`, respectively.
 
 ### ⭐ Build the Pack (3️⃣/3)
