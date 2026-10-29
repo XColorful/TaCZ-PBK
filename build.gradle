@@ -1,0 +1,606 @@
+plugins {
+    id 'java'
+}
+
+// build.cmd 会用 JDK 17 启动 Gradle；直接运行 Gradle 时若 JVM 版本不对则立即失败
+if (JavaVersion.current() != JavaVersion.VERSION_17) {
+    throw new GradleException("Java 17 is required to build this pack (current JVM: ${JavaVersion.current()}). Run build.cmd or set JAVA_HOME to a JDK 17.")
+}
+
+// ---------------------------------------------------------------------------
+// 读取 gradle.properties
+// ---------------------------------------------------------------------------
+def prop = { String key, String fallback = '' ->
+    def value = project.findProperty(key)
+    if (value == null) {
+        return fallback
+    }
+    value = value.toString().trim()
+    return value.isEmpty() ? fallback : value
+}
+
+def modId = prop('mod_id')
+if (!(modId ==~ /[a-z][a-z0-9_]{1,63}/)) {
+    throw new GradleException("Invalid mod_id '${modId}': expected ^[a-z][a-z0-9_]{1,63}\$")
+}
+
+def javaPackage = prop('java_package', prop('mod_group_id'))
+if (!javaPackage) {
+    throw new GradleException('java_package (or mod_group_id) is required in gradle.properties')
+}
+javaPackage.split('\\.').each { segment ->
+    if (!(segment ==~ /[A-Za-z_$][A-Za-z0-9_$]*/)) {
+        throw new GradleException("Invalid java_package '${javaPackage}'")
+    }
+}
+
+def modVersion = prop('mod_version', '0.0.0')
+if (!(modVersion ==~ /[0-9].*/)) {
+    throw new GradleException("Invalid mod_version '${modVersion}': must start with a digit")
+}
+
+def modName = prop('mod_name', modId)
+def modLicense = prop('mod_license')
+if (!modLicense) {
+    throw new GradleException('mod_license is required (NeoForge rejects mod files without a license)')
+}
+def authors = prop('authors', prop('mod_authors'))
+def credits = prop('mod_credits')
+def displayUrl = prop('mod_display_url')
+def logoFile = prop('mod_logo_file')
+def description = prop('description', prop('mod_description', modName))
+def packDescription = prop('pack_description', modName)
+def packFormat = prop('pack_format')
+if (!(packFormat ==~ /\d+/)) {
+    throw new GradleException("Invalid pack_format '${packFormat}': must be an integer")
+}
+def showAsResourcePack = prop('show_as_resource_pack', 'false').toLowerCase()
+if (!(showAsResourcePack in ['true', 'false'])) {
+    throw new GradleException("Invalid show_as_resource_pack '${showAsResourcePack}': must be true or false")
+}
+def copyPluralFolders = prop('enable_datapack_directory_copy', 'true').toLowerCase()
+if (!(copyPluralFolders in ['true', 'false'])) {
+    throw new GradleException("Invalid enable_datapack_directory_copy '${copyPluralFolders}': must be true or false")
+}
+
+def fileBase = prop('file_name', modId).replaceAll(/(?i)\.(jar|zip)$/, '')
+if (!fileBase) {
+    throw new GradleException('Invalid file_name in gradle.properties')
+}
+def jarFileName = "${fileBase}.jar"
+def datapackFileName = "${fileBase}-datapack.zip"
+def resourcepackFileName = "${fileBase}-resourcepack.zip"
+def gunpackFileName = "${fileBase}.zip"
+
+// gunpack_info.json 的填充值：作者列表直接写成 JSON 数组内容，日期默认取当天
+def packAuthors = prop('pack_authors')
+def packDate = prop('pack_date', java.time.LocalDate.now().toString())
+
+// 根目录下所有 LICENSE 开头的文件（LICENSE、LICENSE.txt、LICENSE_OLD 等）都会放进产物
+def licenseFiles = (projectDir.listFiles() ?: new File[0]).findAll {
+    it.isFile() && it.name.startsWith('LICENSE')
+}
+
+if (!file('assets').isDirectory()) {
+    logger.warn('assets/ not found; the resource pack will be empty')
+}
+if (!file('data').isDirectory()) {
+    logger.warn('data/ not found; the data pack will be empty')
+}
+if (logoFile && !file(logoFile).isFile()) {
+    logger.warn("mod_logo_file '${logoFile}' does not exist at the repository root")
+}
+
+// ---------------------------------------------------------------------------
+// 路径
+// ---------------------------------------------------------------------------
+def buildDirectory = layout.buildDirectory.get().asFile
+def generatedRoot = new File(buildDirectory, 'generated')
+def packMcmetaFile = new File(generatedRoot, 'pack.mcmeta')
+def metadataDir = new File(generatedRoot, 'metadata')
+def stubSourceDir = new File(generatedRoot, 'sources/stubs')
+def entrySourceDir = new File(generatedRoot, 'sources/entry')
+def stubClassesDir = new File(buildDirectory, 'classes/stubs')
+def entryClassesDir = new File(buildDirectory, 'classes/entry')
+def stageCommonDir = new File(buildDirectory, 'stage/common')
+def libsDir = new File(buildDirectory, 'libs')
+
+def classNameBase = modId.substring(0, 1).toUpperCase() + modId.substring(1)
+classNameBase = classNameBase.replaceAll(/[^A-Za-z0-9_$]/, '_')
+if (classNameBase ==~ /^[0-9].*/) {
+    classNameBase = '_' + classNameBase
+}
+def forgeClass = classNameBase + 'Forge'
+def neoClass = classNameBase + 'Neoforge'
+def packagePath = javaPackage.replace('.', '/')
+
+def forgeStubFile = new File(stubSourceDir, 'net/minecraftforge/fml/common/Mod.java')
+def neoStubFile = new File(stubSourceDir, 'net/neoforged/fml/common/Mod.java')
+def forgeEntryFile = new File(entrySourceDir, "${packagePath}/${forgeClass}.java")
+def neoEntryFile = new File(entrySourceDir, "${packagePath}/${neoClass}.java")
+
+def writeUtf8 = { File file, String text ->
+    file.parentFile.mkdirs()
+    file.setText(text, 'UTF-8')
+}
+
+// ---------------------------------------------------------------------------
+// 入口类
+// ---------------------------------------------------------------------------
+// Forge/NeoForge 的 @Mod 注解只用于 API 编译；这里生成同名注解的桩类，
+// 编译产物里只保留两个入口类，桩类不会进入 jar（运行时由平台的注解替代）。
+tasks.register('generateEntrySources') {
+    inputs.property('modId', modId)
+    inputs.property('javaPackage', javaPackage)
+    outputs.dir(stubSourceDir)
+    outputs.dir(entrySourceDir)
+    doLast {
+        writeUtf8(forgeStubFile, '''package net.minecraftforge.fml.common;
+
+import java.lang.annotation.ElementType;
+import java.lang.annotation.Retention;
+import java.lang.annotation.RetentionPolicy;
+import java.lang.annotation.Target;
+
+@Retention(RetentionPolicy.RUNTIME)
+@Target(ElementType.TYPE)
+public @interface Mod {
+    String value();
+}
+''')
+        writeUtf8(neoStubFile, '''package net.neoforged.fml.common;
+
+import java.lang.annotation.ElementType;
+import java.lang.annotation.Retention;
+import java.lang.annotation.RetentionPolicy;
+import java.lang.annotation.Target;
+
+@Retention(RetentionPolicy.RUNTIME)
+@Target(ElementType.TYPE)
+public @interface Mod {
+    String value();
+}
+''')
+        writeUtf8(forgeEntryFile, "package ${javaPackage};\n\n@net.minecraftforge.fml.common.Mod(\"${modId}\")\npublic class ${forgeClass} {}\n")
+        writeUtf8(neoEntryFile, "package ${javaPackage};\n\n@net.neoforged.fml.common.Mod(\"${modId}\")\npublic class ${neoClass} {}\n")
+    }
+}
+
+tasks.register('compileModStubs', JavaCompile) {
+    dependsOn 'generateEntrySources'
+    source = fileTree(stubSourceDir) { include '**/*.java' }
+    classpath = files()
+    destinationDirectory.set(stubClassesDir)
+    options.release.set(17)
+    options.encoding = 'UTF-8'
+    options.compilerArgs.add('-proc:none')
+}
+
+tasks.register('compileEntryClasses', JavaCompile) {
+    dependsOn 'generateEntrySources', 'compileModStubs'
+    source = fileTree(entrySourceDir) { include '**/*.java' }
+    classpath = files(stubClassesDir)
+    destinationDirectory.set(entryClassesDir)
+    options.release.set(17)
+    options.encoding = 'UTF-8'
+    options.compilerArgs.add('-proc:none')
+}
+
+tasks.register('verifyEntryClasses') {
+    dependsOn 'compileEntryClasses'
+    // 校验：入口类数量、class 版本、注解引用
+    outputs.upToDateWhen { false }
+    doLast {
+        def expected = [
+                new File(entryClassesDir, "${packagePath}/${forgeClass}.class"),
+                new File(entryClassesDir, "${packagePath}/${neoClass}.class")
+        ]
+        def found = []
+        entryClassesDir.eachFileRecurse { file ->
+            if (file.isFile() && file.name.endsWith('.class')) {
+                found << file
+            }
+        }
+        if (found.size() != 2) {
+            throw new GradleException("Expected exactly 2 entry classes, found ${found.size()}: ${found*.name}")
+        }
+        expected.each { file ->
+            if (!file.isFile()) {
+                throw new GradleException("Missing compiled entry class: ${file}")
+            }
+            def bytes = file.bytes
+            if (bytes.length < 8) {
+                throw new GradleException("Invalid class file: ${file}")
+            }
+            int major = ((bytes[6] & 0xff) << 8) | (bytes[7] & 0xff)
+            if (major != 61) {
+                throw new GradleException("Class ${file.name} uses class file version ${major}; expected 61 (Java 17)")
+            }
+        }
+        def forgeText = new String(expected[0].bytes, 'ISO-8859-1')
+        if (!forgeText.contains('Lnet/minecraftforge/fml/common/Mod;')) {
+            throw new GradleException('Forge entry class does not reference net.minecraftforge.fml.common.Mod')
+        }
+        def neoText = new String(expected[1].bytes, 'ISO-8859-1')
+        if (!neoText.contains('Lnet/neoforged/fml/common/Mod;')) {
+            throw new GradleException('NeoForge entry class does not reference net.neoforged.fml.common.Mod')
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 生成包元数据（pack.mcmeta / mods.toml / neoforge.mods.toml）
+// ---------------------------------------------------------------------------
+def placeholders = [
+        mod_id               : modId,
+        mod_version          : modVersion,
+        mod_name             : modName,
+        mod_license          : modLicense,
+        mod_display_url      : displayUrl,
+        mod_logo_file        : logoFile,
+        mod_credits          : credits,
+        authors              : authors,
+        description          : description,
+        mod_authors          : authors,
+        mod_description      : description,
+        pack_description     : packDescription,
+        pack_format          : packFormat,
+        pack_authors         : packAuthors,
+        pack_date            : packDate,
+        show_as_resource_pack: showAsResourcePack
+]
+
+def expandTemplate = { File template, Map<String, String> values ->
+    if (!template.isFile()) {
+        throw new GradleException("Missing template file: ${template}")
+    }
+    def text = template.getText('UTF-8')
+    values.each { key, value ->
+        text = text.replace('${' + key + '}', value.toString())
+    }
+    def leftovers = text =~ /\$\{[A-Za-z0-9_]+\}/
+    if (leftovers.find()) {
+        throw new GradleException("Unresolved placeholder in ${template.name}: ${leftovers.group()}")
+    }
+    return text
+}
+
+def stripLogoLine = { String text ->
+    text.replaceAll(/(?m)^logoFile=.*\r?\n/, '')
+}
+
+tasks.register('generatePackMetadata') {
+    inputs.files(file('pack.mcmeta'), file('META-INF/mods.toml'), file('META-INF/neoforge.mods.toml'), file('gradle.properties'))
+    outputs.file(packMcmetaFile)
+    outputs.dir(metadataDir)
+    doLast {
+        def packMcmeta = expandTemplate(file('pack.mcmeta'), placeholders)
+        def modsToml = expandTemplate(file('META-INF/mods.toml'), placeholders)
+        def neoModsToml = expandTemplate(file('META-INF/neoforge.mods.toml'), placeholders)
+        if (!logoFile) {
+            modsToml = stripLogoLine(modsToml)
+            neoModsToml = stripLogoLine(neoModsToml)
+        }
+        writeUtf8(packMcmetaFile, packMcmeta)
+        writeUtf8(new File(metadataDir, 'mods.toml'), modsToml)
+        writeUtf8(new File(metadataDir, 'neoforge.mods.toml'), neoModsToml)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 产物内容暂存
+// ---------------------------------------------------------------------------
+// tags 目录在 MC 不同版本中分别使用单数/复数命名，产物里两种都提供
+def tagFolderPairs = [['blocks', 'block'], ['entity_types', 'entity_type']]
+def recipeFolderPair = ['recipes', 'recipe']
+
+def stageRelative = { File file ->
+    def prefix = stageCommonDir.absolutePath
+    if (file.absolutePath.startsWith(prefix)) {
+        return file.absolutePath.substring(prefix.length()).replace('\\', '/').replaceFirst('^/', '')
+    }
+    return file.absolutePath
+}
+
+// 递归复制目录内容（只复制文件，不复制根目录本身）
+def copyTree = { File source, File target ->
+    source.eachFileRecurse { File file ->
+        if (!file.isFile()) {
+            return
+        }
+        def relative = source.toPath().relativize(file.toPath()).toString()
+        def destination = new File(target, relative)
+        destination.parentFile.mkdirs()
+        destination.bytes = file.bytes
+    }
+}
+
+// 检测单数/复数目录（data/<namespace>/tags/blocks 与 block、data/<namespace>/recipes 与 recipe），缺哪个就补哪个
+def duplicateVersionFolders = { File dataDir ->
+    if (!dataDir.isDirectory()) {
+        return 0
+    }
+    def duplicatePair = { File parent, List<String> pair, String tag ->
+        def plural = new File(parent, pair[0])
+        def singular = new File(parent, pair[1])
+        if (plural.isDirectory() && !singular.exists()) {
+            singular.mkdirs()
+            copyTree(plural, singular)
+            logger.lifecycle("  [${tag}] ${stageRelative(plural)} -> ${singular.name}")
+            return 1
+        } else if (singular.isDirectory() && !plural.exists()) {
+            plural.mkdirs()
+            copyTree(singular, plural)
+            logger.lifecycle("  [${tag}] ${stageRelative(singular)} -> ${plural.name}")
+            return 1
+        }
+        return 0
+    }
+    def tagsDirs = []
+    def direct = new File(dataDir, 'tags')
+    if (direct.isDirectory()) {
+        tagsDirs << direct
+    }
+    dataDir.eachDir { namespace ->
+        def tags = new File(namespace, 'tags')
+        if (tags.isDirectory()) {
+            tagsDirs << tags
+        }
+    }
+    int count = 0
+    tagsDirs.each { tagsDir ->
+        tagFolderPairs.each { pair ->
+            count += duplicatePair(tagsDir, pair, 'tags')
+        }
+    }
+    dataDir.eachDir { namespace ->
+        if (namespace.name != 'tags') {
+            count += duplicatePair(namespace, recipeFolderPair, 'recipe')
+        }
+    }
+    return count
+}
+
+// 填充暂存的元数据文件：
+// - assets/<namespace>/gunpack_info.json 使用 gradle.properties 的占位符
+// - 根目录 gunpack.meta.json 自动填充 ${namespace}（唯一的 info 命名空间或同行 mod_id），也可以手写完整内容
+// 文件没有占位符时原样保留，因此手写的完整文件也能直接构建。
+def fillPackMetadata = { File assetsDir, File metaFile ->
+    def fill = { File file, Map<String, String> values, String tag ->
+        def original = file.getText('UTF-8')
+        def text = original
+        values.each { key, value ->
+            text = text.replace('${' + key + '}', value.toString())
+        }
+        if (text != original) {
+            file.setText(text, 'UTF-8')
+            logger.lifecycle("  [${tag}] filled ${stageRelative(file)}")
+        }
+        // 未知占位符只提示不阻断构建
+        def unresolved = (text =~ /\$\{[A-Za-z0-9_]+\}/)
+        if (unresolved.find()) {
+            logger.warn("  [${tag}] unresolved placeholder(s) in ${stageRelative(file)}: ${unresolved.group()}")
+        }
+    }
+    def infoNamespaces = []
+    if (assetsDir.isDirectory()) {
+        assetsDir.eachDir { namespace ->
+            def info = new File(namespace, 'gunpack_info.json')
+            if (info.isFile()) {
+                fill(info, placeholders, 'info')
+                infoNamespaces << namespace.name
+            }
+        }
+    }
+    if (metaFile.isFile()) {
+        if (metaFile.getText('UTF-8').contains('${namespace}')) {
+            // assets 下可能有多个命名空间，优先取唯一的那个，其次取与 mod_id 同名的那个；都没有就必须手写
+            def namespace = infoNamespaces.size() == 1 ? infoNamespaces[0] : (modId in infoNamespaces ? modId : null)
+            if (namespace == null) {
+                throw new GradleException("Cannot pick a namespace for gunpack.meta.json automatically (found ${infoNamespaces}); write it manually instead of \${namespace}")
+            }
+            fill(metaFile, [namespace: namespace], 'meta')
+        } else {
+            fill(metaFile, [:], 'meta')
+        }
+    }
+}
+
+tasks.register('stageCommon', Sync) {
+    dependsOn 'generatePackMetadata'
+    into stageCommonDir
+    from('assets') { into 'assets' }
+    from('data') { into 'data' }
+    from(packMcmetaFile)
+    if (file('pack.png').isFile()) {
+        from('pack.png')
+    }
+    if (file('gunpack.meta.json').isFile()) {
+        from('gunpack.meta.json')
+    }
+    from(licenseFiles)
+    outputs.upToDateWhen { false }
+    doLast {
+        fillPackMetadata(new File(stageCommonDir, 'assets'), new File(stageCommonDir, 'gunpack.meta.json'))
+        if (copyPluralFolders == 'true') {
+            def count = duplicateVersionFolders(new File(stageCommonDir, 'data'))
+            if (count == 0) {
+                logger.lifecycle('  [dirs] no singular/plural duplicates needed')
+            }
+        } else {
+            logger.lifecycle('  [dirs] singular/plural copy disabled (enable_datapack_directory_copy=false)')
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 产物：模组 jar、数据包、资源包、枪包 zip
+// ---------------------------------------------------------------------------
+// 模组 jar：包内容 + 两套平台元数据 + 两个入口类（桩类不打包）
+tasks.named('jar', Jar) {
+    dependsOn 'verifyEntryClasses', 'stageCommon'
+    archiveFileName = jarFileName
+    destinationDirectory.set(libsDir)
+    duplicatesStrategy = DuplicatesStrategy.EXCLUDE
+    from(stageCommonDir)
+    from(metadataDir) { into 'META-INF' }
+    from(entryClassesDir) { include '**/*.class' }
+    manifest {
+        attributes(
+                'Implementation-Title': modName,
+                'Implementation-Version': modVersion
+        )
+    }
+}
+
+// 数据包：只包含 data/、pack.mcmeta、pack.png、根 gunpack.meta.json 和协议文件
+tasks.register('datapackZip', Zip) {
+    dependsOn 'stageCommon'
+    archiveFileName = datapackFileName
+    destinationDirectory.set(libsDir)
+    duplicatesStrategy = DuplicatesStrategy.EXCLUDE
+    from(stageCommonDir) {
+        include 'data/**'
+        include 'gunpack.meta.json'
+        include 'pack.mcmeta'
+        include 'pack.png'
+        include 'LICENSE*'
+        includeEmptyDirs = true
+    }
+}
+
+// 资源包：只包含 assets/、pack.mcmeta、pack.png 和协议文件
+tasks.register('resourcepackZip', Zip) {
+    dependsOn 'stageCommon'
+    archiveFileName = resourcepackFileName
+    destinationDirectory.set(libsDir)
+    duplicatesStrategy = DuplicatesStrategy.EXCLUDE
+    from(stageCommonDir) {
+        include 'assets/**'
+        include 'pack.mcmeta'
+        include 'pack.png'
+        include 'LICENSE*'
+        includeEmptyDirs = true
+    }
+}
+
+// 枪包：直接放进 ./tacz/ 的 zip，根目录 gunpack.meta.json + assets/ + data/ + 协议文件
+tasks.register('gunpackZip', Zip) {
+    dependsOn 'stageCommon'
+    archiveFileName = gunpackFileName
+    destinationDirectory.set(libsDir)
+    duplicatesStrategy = DuplicatesStrategy.EXCLUDE
+    from(stageCommonDir) {
+        include 'gunpack.meta.json'
+        include 'assets/**'
+        include 'data/**'
+        include 'LICENSE*'
+        includeEmptyDirs = true
+    }
+}
+
+// 校验产物：入口类、元数据、目录归属和协议文件
+tasks.register('verifyArtifacts') {
+    dependsOn 'jar', 'datapackZip', 'resourcepackZip', 'gunpackZip'
+    outputs.upToDateWhen { false }
+    doLast {
+        def readEntries = { File archive ->
+            def result = []
+            def zip = new java.util.zip.ZipFile(archive)
+            try {
+                def enumeration = zip.entries()
+                while (enumeration.hasMoreElements()) {
+                    result << enumeration.nextElement().name
+                }
+            } finally {
+                zip.close()
+            }
+            return result
+        }
+
+        def jarFile = new File(libsDir, jarFileName)
+        def datapackFile = new File(libsDir, datapackFileName)
+        def resourcepackFile = new File(libsDir, resourcepackFileName)
+        def gunpackFile = new File(libsDir, gunpackFileName)
+        [jarFile, datapackFile, resourcepackFile, gunpackFile].each { file ->
+            if (!file.isFile() || file.length() == 0) {
+                throw new GradleException("Missing or empty artifact: ${file}")
+            }
+        }
+
+        def jarEntries = readEntries(jarFile)
+        [
+                'META-INF/mods.toml',
+                'META-INF/neoforge.mods.toml',
+                'gunpack.meta.json',
+                'pack.mcmeta',
+                packagePath + '/' + forgeClass + '.class',
+                packagePath + '/' + neoClass + '.class'
+        ].each { required ->
+            if (!(required in jarEntries)) {
+                throw new GradleException("Mod jar is missing entry: ${required}")
+            }
+        }
+        def classEntries = jarEntries.findAll { it.endsWith('.class') }
+        if (classEntries.size() != 2) {
+            throw new GradleException("Expected exactly 2 class entries in the mod jar, found ${classEntries.size()}: ${classEntries}")
+        }
+        if (classEntries.any { it ==~ /^net\/(minecraftforge|neoforged)\/.*\.class$/ }) {
+            throw new GradleException("Stub @Mod classes leaked into the mod jar: ${classEntries}")
+        }
+
+        def datapackEntries = readEntries(datapackFile)
+        if (!('pack.mcmeta' in datapackEntries)) {
+            throw new GradleException('Data pack is missing pack.mcmeta')
+        }
+        if (!('gunpack.meta.json' in datapackEntries)) {
+            throw new GradleException('Data pack is missing root gunpack.meta.json')
+        }
+        if (!datapackEntries.any { it.startsWith('data/') }) {
+            throw new GradleException('Data pack has no data/ entries')
+        }
+        if (datapackEntries.any { it.startsWith('assets/') || it.startsWith('META-INF/') }) {
+            throw new GradleException('Data pack unexpectedly contains assets/ or META-INF/')
+        }
+
+        def resourcepackEntries = readEntries(resourcepackFile)
+        if (!('pack.mcmeta' in resourcepackEntries)) {
+            throw new GradleException('Resource pack is missing pack.mcmeta')
+        }
+        if (!resourcepackEntries.any { it.startsWith('assets/') }) {
+            throw new GradleException('Resource pack has no assets/ entries')
+        }
+        if (resourcepackEntries.any { it.startsWith('data/') || it.startsWith('META-INF/') }) {
+            throw new GradleException('Resource pack unexpectedly contains data/ or META-INF/')
+        }
+
+        def gunpackEntries = readEntries(gunpackFile)
+        if (!('gunpack.meta.json' in gunpackEntries)) {
+            throw new GradleException('Gun pack zip is missing root gunpack.meta.json')
+        }
+        if (!gunpackEntries.any { it.startsWith('assets/') }) {
+            throw new GradleException('Gun pack zip has no assets/ entries')
+        }
+        if (!gunpackEntries.any { it.startsWith('data/') }) {
+            throw new GradleException('Gun pack zip has no data/ entries')
+        }
+
+        def licenseNames = licenseFiles*.name
+        licenseNames.each { name ->
+            [jarEntries, datapackEntries, resourcepackEntries, gunpackEntries].each { entries ->
+                if (!(name in entries)) {
+                    throw new GradleException("Artifact is missing root license file: ${name}")
+                }
+            }
+        }
+
+        logger.lifecycle('Outputs:')
+        [jarFile, datapackFile, resourcepackFile, gunpackFile].each { file ->
+            logger.lifecycle("  ${file.absolutePath} (${file.length()} bytes)")
+        }
+    }
+}
+
+tasks.named('assemble') {
+    dependsOn 'verifyArtifacts'
+}

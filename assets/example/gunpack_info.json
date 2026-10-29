@@ -1,0 +1,11 @@
+{
+	"version": "${mod_version}",
+	"name": "pack.example.name",
+	"desc": "pack.example.desc",
+	"license": "${mod_license}",
+	"authors": [
+		${pack_authors}
+	],
+	"date": "${pack_date}",
+	"url": "${mod_display_url}"
+}
