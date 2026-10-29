@@ -64,6 +64,20 @@ def zipHasRootEntry = { File archive, String entryName ->
     }
 }
 
+// 由枪包名（压缩包带 .zip 后缀）派生的 6 位盐，产物包名固定为 com.<盐>.<mod_id>：
+// 同名文件夹与同名压缩包得到不同的盐，不同枪包之间也不会共用同一个 Java 包
+def packGroupSalt = { String packName ->
+    def digest = java.security.MessageDigest.getInstance('SHA-256').digest(packName.getBytes('UTF-8'))
+    def alphabet = 'abcdefghijklmnopqrstuvwxyz'
+    def alnum = alphabet + '0123456789'
+    def builder = new StringBuilder()
+    builder.append(alphabet.charAt((digest[0] as int & 0xff) % alphabet.length()))
+    (1..5).each { int index ->
+        builder.append(alnum.charAt((digest[index] as int & 0xff) % alnum.length()))
+    }
+    return builder.toString()
+}
+
 // 枪包自带的命名空间：assets/ 与 data/ 下的一级目录
 def packNamespaces = { File pack ->
     def names = new LinkedHashSet<String>()
@@ -330,8 +344,10 @@ tasks.register('batchConvert') {
                 def packSourceName = pack.name.toLowerCase().endsWith('.zip')
                         ? pack.name.substring(0, pack.name.length() - 4)
                         : pack.name
+                def groupSalt = packGroupSalt(pack.name)
                 def gradleArgs = ['-p', tempDir.absolutePath, '--no-daemon', '--console=plain',
-                                  "-Ppack_source_name=${packSourceName}"]
+                                  "-Ppack_source_name=${packSourceName}",
+                                  "-Pmod_group_salt=${groupSalt}"]
                 def exitCode = runGradle(gradleArgs + ['migration'])
                 if (exitCode != 0) {
                     reason = "migration failed (exit code ${exitCode})"

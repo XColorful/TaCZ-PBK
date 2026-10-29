@@ -301,12 +301,15 @@ tasks.register('migration') {
             if (setProperty(propsFile, 'mod_id', namespace)) {
                 note("mod_id -> ${namespace}")
             }
-            // 模板里可能残留上一个枪包的 com.example.<旧命名空间>；多个产物共用同一个包时
-            // Forge 会抛 ResolutionException（Modules xxx and yyy export package ...）直接崩溃
+            // 模板里可能残留上一个枪包的 group id；多个产物共用同一个包时
+            // Forge 会抛 ResolutionException（Modules xxx and yyy export package ...）直接崩溃。
+            // 批处理会传入由枪包名派生的盐，包名固定为 com.<盐>.<mod_id>
+            def groupSalt = project.findProperty('mod_group_salt')?.toString()?.trim()
             def currentGroup = propertyValue(propsFile, 'mod_group_id')
-            if ((currentGroup == null || currentGroup.startsWith('com.example.')) &&
-                    setProperty(propsFile, 'mod_group_id', 'com.example.' + namespace)) {
-                note("mod_group_id -> com.example.${namespace}")
+            def groupId = groupSalt ? "com.${groupSalt}.${namespace}" : "com.example.${namespace}"
+            if ((groupSalt || currentGroup == null || currentGroup.startsWith('com.example.')) &&
+                    setProperty(propsFile, 'mod_group_id', groupId)) {
+                note("mod_group_id -> ${groupId}")
             }
             if (!isPlaceholder(meta.namespace)) {
                 // gunpack.meta.json 的 ${namespace} 由 build 从 gunpack_info.json 的命名空间填充；
