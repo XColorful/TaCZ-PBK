@@ -64,6 +64,53 @@ def zipHasRootEntry = { File archive, String entryName ->
     }
 }
 
+// 枪包自带的命名空间：assets/ 与 data/ 下的一级目录
+def packNamespaces = { File pack ->
+    def names = new LinkedHashSet<String>()
+    if (pack.isDirectory()) {
+        ['assets', 'data'].each { String kind ->
+            def kindDir = new File(pack, kind)
+            (kindDir.listFiles() ?: new File[0]).each { File child ->
+                if (child.isDirectory()) {
+                    names << child.name
+                }
+            }
+        }
+        return names
+    }
+    def zip = new java.util.zip.ZipFile(pack)
+    try {
+        def it = zip.entries()
+        while (it.hasMoreElements()) {
+            def entryName = it.nextElement().name.replace('\\', '/')
+            def matcher = entryName =~ /^(?:assets|data)\/([^\/]+)\//
+            if (matcher.find()) {
+                names << matcher.group(1)
+            }
+        }
+    } finally {
+        zip.close()
+    }
+    return names
+}
+
+// 模板根目录可能还留着上次迁移的枪包；这些命名空间不属于当前枪包，
+// 不删掉的话每个产物都会带上同一份资源，多个模组装在一起就会重复注册
+def stripForeignNamespaces = { File root, Set<String> keep ->
+    if (keep.isEmpty()) {
+        return
+    }
+    ['assets', 'data'].each { String kind ->
+        def kindDir = new File(root, kind)
+        (kindDir.listFiles() ?: new File[0]).each { File child ->
+            if (child.isDirectory() && !keep.contains(child.name)) {
+                deleteRecursively(child)
+                note("Removed leftover namespace ${kind}/${child.name}")
+            }
+        }
+    }
+}
+
 def extractZip = { File archive, File targetDir ->
     def rootPath = targetDir.canonicalPath
     def zip = new java.util.zip.ZipFile(archive)
@@ -275,6 +322,7 @@ tasks.register('batchConvert') {
                 } else {
                     extractZip(pack, tempDir)
                 }
+                stripForeignNamespaces(tempDir, packNamespaces(pack))
 
                 // migration 会改写 gradle.properties，必须单独启动一次构建，
                 // 否则同一次构建里的 build 仍按迁移前的属性读取。

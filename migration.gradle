@@ -64,6 +64,12 @@ def setProperty = { File propsFile, String key, Object value ->
     return true
 }
 
+def propertyValue = { File propsFile, String key ->
+    def pattern = java.util.regex.Pattern.compile('(?m)^\\s*' + java.util.regex.Pattern.quote(key) + '\\s*=\\s*(.*)$')
+    def matcher = pattern.matcher(propsFile.getText('UTF-8'))
+    return matcher.find() ? matcher.group(1).trim() : null
+}
+
 def hasPropertyValue = { File propsFile, String key, String expected ->
     def pattern = java.util.regex.Pattern.compile('(?m)^\\s*' + java.util.regex.Pattern.quote(key) + '\\s*=\\s*' + java.util.regex.Pattern.quote(expected) + '\\s*$')
     pattern.matcher(propsFile.getText('UTF-8')).find()
@@ -295,7 +301,11 @@ tasks.register('migration') {
             if (setProperty(propsFile, 'mod_id', namespace)) {
                 note("mod_id -> ${namespace}")
             }
-            if (hasPropertyValue(propsFile, 'mod_group_id', 'com.example.example') && setProperty(propsFile, 'mod_group_id', 'com.example.' + namespace)) {
+            // 模板里可能残留上一个枪包的 com.example.<旧命名空间>；多个产物共用同一个包时
+            // Forge 会抛 ResolutionException（Modules xxx and yyy export package ...）直接崩溃
+            def currentGroup = propertyValue(propsFile, 'mod_group_id')
+            if ((currentGroup == null || currentGroup.startsWith('com.example.')) &&
+                    setProperty(propsFile, 'mod_group_id', 'com.example.' + namespace)) {
                 note("mod_group_id -> com.example.${namespace}")
             }
             if (!isPlaceholder(meta.namespace)) {
