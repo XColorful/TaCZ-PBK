@@ -40,8 +40,11 @@
 
 ## 已有枪包的迁移
 
-- 将原本放置于`./tacz/`的枪包解压到模板文件夹根目录即可
-- 可以参照模板示例的`./gunpack.meta.json`、`./assets/example/gunpack_info.json`选用自动填充功能
+- 将原本放置于`./tacz/`的枪包解压到模板文件夹根目录
+
+然后，任选以下一种方式：
+- 在 Windows 下运行`migration.cmd`
+- 或者，在 Intellij IDEA 中用 JDK 17 执行 Gradle 的 `migration` 任务
 
 ## 用途
 
@@ -93,7 +96,10 @@ Build artifacts will be generated in `build/libs`:
 ## Migrating Existing Gun Packs
 
 - Extract the gun pack originally placed in `./tacz/` directly into the root directory of the template folder.
-- You can refer to `./gunpack.meta.json` and `./assets/example/gunpack_info.json` in the template examples to enable the auto-fill feature.
+
+Then, choose either of the following methods:
+- Run `migration.cmd` on Windows.
+- Alternatively, open the project in IntelliJ IDEA and run the Gradle `migration` task using JDK 17.
 
 ## Purpose
 

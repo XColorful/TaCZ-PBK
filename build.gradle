@@ -628,3 +628,6 @@ tasks.register('verifyArtifacts') {
 tasks.named('assemble') {
     dependsOn 'verifyArtifacts'
 }
+
+// 枪包迁移任务：migration.cmd 与 IDEA 的 Gradle 任务面板都通过这里执行
+apply from: 'migration.gradle'
