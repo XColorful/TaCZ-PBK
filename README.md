@@ -41,11 +41,22 @@
 
 ## 已有枪包的迁移
 
+### 单个枪包
+
 - 将原本放置于`./tacz/`的枪包解压到模板文件夹根目录
 
 然后，任选以下一种方式：
 - 在 Windows 下运行`migration.cmd`
 - 或者，在 Intellij IDEA 中用 JDK 17 执行 Gradle 的 `migration` 任务
+
+### 批量转换
+
+任选以下一种方式：
+- 在 Windows 下运行`batch_convert.cmd`
+- 或者，在 Intellij IDEA 中用 JDK 17 执行 Gradle 的 `batch_convert` 任务
+
+然后，输入`版本文件夹`并等待转换完成
+- 转换成功的枪包将自动放入`./mods/`，并在`./tacz-backup/`生成回滚备份
 
 ## 用途
 
@@ -97,11 +108,22 @@ Build artifacts will be generated in `build/libs`:
 
 ## Migrating Existing Gun Packs
 
+### Single Gun Pack
+
 - Extract the gun pack originally placed in `./tacz/` directly into the root directory of the template folder.
 
 Then, choose either of the following methods:
 - Run `migration.cmd` on Windows.
 - Alternatively, open the project in IntelliJ IDEA and run the Gradle `migration` task using JDK 17.
+
+### Batch Conversion
+
+Choose either of the following methods:
+- Run `batch_convert.cmd` on Windows.
+- Alternatively, open the project in IntelliJ IDEA and run the Gradle `batch_convert` task using JDK 17.
+
+Then, enter the `version folder` and wait for the conversion to complete
+- Successfully converted gun packs will be automatically placed in `./mods/`, and a rollback backup will be generated in `./tacz-backup/`.
 
 ## Purpose
 

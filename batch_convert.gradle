@@ -1,0 +1,370 @@
+import groovy.json.JsonSlurper
+
+// 批量转换：遍历 <版本文件夹>/tacz 下的枪包（.zip 或文件夹），
+// 逐个复制到 tacz-temp、套用模板执行 migration + build，
+// 合格的 .jar 移入 <版本文件夹>/mods，原枪包移入 <版本文件夹>/tacz-backup。
+// 控制台输出保持 ASCII，避免 Windows 代码页把中文变成乱码。
+
+def note = { String message -> println("  [batch] ${message}") }
+
+def copyFile = { File source, File target ->
+    target.parentFile.mkdirs()
+    source.withInputStream { input ->
+        target.withOutputStream { output -> output << input }
+    }
+}
+
+def copyMerge = null
+copyMerge = { File source, File target ->
+    if (!source.exists()) {
+        return
+    }
+    if (source.isDirectory()) {
+        target.mkdirs()
+        source.eachFile { File child -> copyMerge(child, new File(target, child.name)) }
+    } else {
+        copyFile(source, target)
+    }
+}
+
+def deleteRecursively = null
+deleteRecursively = { File file ->
+    if (!file.exists()) {
+        return
+    }
+    if (file.isDirectory()) {
+        file.eachFile { File child -> deleteRecursively(child) }
+    }
+    file.delete()
+}
+
+def moveReplace = { File source, File target ->
+    if (target.exists()) {
+        deleteRecursively(target)
+    }
+    target.parentFile.mkdirs()
+    if (!source.renameTo(target)) {
+        copyMerge(source, target)
+        deleteRecursively(source)
+    }
+}
+
+def readProperties = { File file ->
+    def properties = new Properties()
+    file.withInputStream { properties.load(it) }
+    return properties
+}
+
+def zipHasRootEntry = { File archive, String entryName ->
+    def zip = new java.util.zip.ZipFile(archive)
+    try {
+        return zip.getEntry(entryName) != null
+    } finally {
+        zip.close()
+    }
+}
+
+def extractZip = { File archive, File targetDir ->
+    def rootPath = targetDir.canonicalPath
+    def zip = new java.util.zip.ZipFile(archive)
+    try {
+        def entries = zip.entries()
+        while (entries.hasMoreElements()) {
+            def entry = entries.nextElement()
+            // Windows 下打的包可能用反斜杠分隔条目，统一成 /
+            def entryName = entry.name.replace('\\', '/')
+            def target = new File(targetDir, entryName).canonicalFile
+            if (target.path != rootPath && !target.path.startsWith(rootPath + File.separator)) {
+                throw new IOException("Archive entry escapes target directory: ${entryName}")
+            }
+            if (entry.isDirectory() || entryName.endsWith('/')) {
+                target.mkdirs()
+                continue
+            }
+            target.parentFile.mkdirs()
+            zip.getInputStream(entry).withStream { input ->
+                target.withOutputStream { output -> output << input }
+            }
+        }
+    } finally {
+        zip.close()
+    }
+}
+
+// 判定产物是否可用：jar 里要有 mod_id，且入口类包路径不能还是模板默认的 com.example.example
+def inspectJar = { File jarFile ->
+    def entries = []
+    String modsToml = null
+    String fabricModJson = null
+    def zip = new java.util.zip.ZipFile(jarFile)
+    try {
+        def it = zip.entries()
+        while (it.hasMoreElements()) {
+            def entry = it.nextElement()
+            def entryName = entry.name.replace('\\', '/')
+            entries << entryName
+            if (entryName == 'META-INF/mods.toml') {
+                modsToml = zip.getInputStream(entry).withCloseable { stream -> stream.getText('UTF-8') }
+            } else if (entryName == 'fabric.mod.json') {
+                fabricModJson = zip.getInputStream(entry).withCloseable { stream -> stream.getText('UTF-8') }
+            }
+        }
+    } finally {
+        zip.close()
+    }
+
+    String modId = null
+    if (modsToml != null) {
+        def matcher = modsToml =~ /(?m)^\s*modId\s*=\s*"([^"]*)"/
+        if (matcher.find()) {
+            modId = matcher.group(1).trim()
+        }
+    }
+    if (!modId && fabricModJson != null) {
+        try {
+            def parsed = new JsonSlurper().parseText(fabricModJson)
+            if (parsed instanceof Map && parsed.id != null) {
+                modId = parsed.id.toString().trim()
+            }
+        } catch (Exception ignored) {
+        }
+    }
+    if (!modId) {
+        return [ok: false, message: 'No mod_id in the jar output']
+    }
+
+    def classEntries = entries.findAll { it.endsWith('.class') }
+    if (classEntries.isEmpty()) {
+        return [ok: false, message: 'No entry classes in the jar output']
+    }
+    if (classEntries.any { it.startsWith('com/example/example/') }) {
+        return [ok: false, message: "mod_id '${modId}' still uses package com.example.example"]
+    }
+    return [ok: true, modId: modId]
+}
+
+def runGradle = { List<String> arguments ->
+    // 直接用 java 运行 Gradle Wrapper 主类：路径含空格时 cmd /c 的引号解析会出错
+    def javaExecutable = null
+    def javaHome = System.getenv('JAVA_HOME')
+    if (javaHome) {
+        javaExecutable = new File(javaHome, 'bin/java.exe')
+        if (!javaExecutable.isFile()) {
+            javaExecutable = new File(javaHome, 'bin/java')
+        }
+    }
+    if (javaExecutable == null || !javaExecutable.isFile()) {
+        def binDir = new File(System.getProperty('java.home'), 'bin')
+        javaExecutable = new File(binDir, 'java.exe')
+        if (!javaExecutable.isFile()) {
+            javaExecutable = new File(binDir, 'java')
+        }
+    }
+    def wrapperJar = new File(projectDir, 'gradle/wrapper/gradle-wrapper.jar')
+    def command = [javaExecutable.absolutePath, '-classpath', wrapperJar.absolutePath,
+                   'org.gradle.wrapper.GradleWrapperMain'] + arguments
+    def result = project.exec { spec ->
+        spec.commandLine command
+        spec.ignoreExitValue = true
+    }
+    return result.exitValue
+}
+
+tasks.register('batchConvert') {
+    group = 'build'
+    description = 'Convert every gun pack under <version folder>/tacz and place the jars in <version folder>/mods'
+    doLast {
+        def resolveVersionDir = {
+            def value = project.findProperty('versionDir')
+            if (value != null && !value.toString().trim().isEmpty()) {
+                return value.toString()
+            }
+            try {
+                println()
+                println('Version folder (contains tacz/ and mods/):')
+                print('> ')
+                System.out.flush()
+                return System.in.newReader().readLine()
+            } catch (Exception ignored) {
+                return null
+            }
+        }
+
+        def versionDirInput = resolveVersionDir()
+        versionDirInput = versionDirInput == null ? '' : versionDirInput.trim().replaceAll(/^"+|"+$/, '')
+        if (!versionDirInput) {
+            println('[batch] No version folder given, exiting')
+            return
+        }
+
+        def versionDir = new File(versionDirInput)
+        if (!versionDir.isAbsolute()) {
+            versionDir = new File(projectDir, versionDirInput)
+        }
+        versionDir = versionDir.canonicalFile
+        if (!versionDir.isDirectory()) {
+            println("[batch] Version folder not found: ${versionDir}")
+            return
+        }
+
+        def taczDir = new File(versionDir, 'tacz')
+        if (!taczDir.isDirectory()) {
+            println("[batch] No ./tacz/ directory under the version folder, exiting: ${taczDir}")
+            return
+        }
+
+        def modsDir = new File(versionDir, 'mods')
+        def backupDir = new File(versionDir, 'tacz-backup')
+        def tempDir = new File(versionDir, 'tacz-temp')
+
+        def packs = (taczDir.listFiles() ?: new File[0]).findAll { file ->
+            (file.isFile() && file.name.toLowerCase().endsWith('.zip')) || file.isDirectory()
+        }.sort { a, b -> a.name <=> b.name }
+
+        if (packs.isEmpty()) {
+            println("[batch] No .zip files or folders under ./tacz/: ${taczDir}")
+            return
+        }
+
+        // 模板文件取自本仓库根目录；tacz-temp 与这些目录互不嵌套
+        def templateExcludes = ['.git', '.gradle', '.idea', 'build', 'out', 'run', '.run',
+                                'tacz', 'tacz-temp', 'tacz-backup', 'mods'] as Set
+
+        def copyTemplate = { File target ->
+            projectDir.listFiles()?.each { File file ->
+                if (templateExcludes.contains(file.name)) {
+                    return
+                }
+                copyMerge(file, new File(target, file.name))
+            }
+        }
+
+        def succeeded = []
+        def failed = []
+        def skipped = []
+
+        // 模板默认的 file_name：migration 没识别出名称时会原样保留，这种产物不能算成功
+        def templateFileBase = readProperties(new File(projectDir, 'gradle.properties'))
+                .getProperty('file_name', '').trim()
+
+        packs.each { File pack ->
+            note("Processing ${pack.name}")
+            def hasMeta
+            try {
+                hasMeta = pack.isDirectory()
+                        ? new File(pack, 'gunpack.meta.json').isFile()
+                        : zipHasRootEntry(pack, 'gunpack.meta.json')
+            } catch (Exception exception) {
+                hasMeta = false
+                note("Cannot read ${pack.name}: ${exception.message}")
+            }
+            if (!hasMeta) {
+                skipped << pack.name
+                note("Skipped ${pack.name}: no gunpack.meta.json at root")
+                return
+            }
+
+            def convertedJar = null
+            def reason = null
+            try {
+                deleteRecursively(tempDir)
+                tempDir.mkdirs()
+                copyTemplate(tempDir)
+                if (pack.isDirectory()) {
+                    copyMerge(pack, tempDir)
+                } else {
+                    extractZip(pack, tempDir)
+                }
+
+                // migration 会改写 gradle.properties，必须单独启动一次构建，
+                // 否则同一次构建里的 build 仍按迁移前的属性读取。
+                // pack_source_name 供 migration 在枪包内找不到名称时兜底
+                def packSourceName = pack.name.toLowerCase().endsWith('.zip')
+                        ? pack.name.substring(0, pack.name.length() - 4)
+                        : pack.name
+                def gradleArgs = ['-p', tempDir.absolutePath, '--no-daemon', '--console=plain',
+                                  "-Ppack_source_name=${packSourceName}"]
+                def exitCode = runGradle(gradleArgs + ['migration'])
+                if (exitCode != 0) {
+                    reason = "migration failed (exit code ${exitCode})"
+                }
+                if (reason == null) {
+                    exitCode = runGradle(gradleArgs + ['build'])
+                    if (exitCode != 0) {
+                        reason = "build failed (exit code ${exitCode})"
+                    }
+                }
+                if (reason == null) {
+                    def properties = readProperties(new File(tempDir, 'gradle.properties'))
+                    def fileBase = properties.getProperty('file_name', properties.getProperty('mod_id', ''))
+                    if (templateFileBase && fileBase == templateFileBase) {
+                        reason = "file_name is still the template default '${templateFileBase}'"
+                    } else {
+                        def jarFile = fileBase ? new File(tempDir, "build/libs/${fileBase}.jar") : null
+                        if (jarFile == null || !jarFile.isFile()) {
+                            def libsDir = new File(tempDir, 'build/libs')
+                            def jars = (libsDir.listFiles() ?: new File[0]).findAll {
+                                it.isFile() && it.name.toLowerCase().endsWith('.jar')
+                            }
+                            jarFile = jars.size() == 1 ? jars[0] : null
+                        }
+                        if (jarFile == null) {
+                            reason = 'No unique .jar output found'
+                        } else {
+                            def inspection = inspectJar(jarFile)
+                            if (!inspection.ok) {
+                                reason = inspection.message
+                            } else {
+                                convertedJar = jarFile
+                            }
+                        }
+                    }
+                }
+            } catch (Exception exception) {
+                reason = exception.message
+            }
+
+            if (convertedJar != null) {
+                modsDir.mkdirs()
+                def modTarget = new File(modsDir, convertedJar.name)
+                if (modTarget.isFile()) {
+                    note("Overwriting existing mods/${modTarget.name}")
+                }
+                moveReplace(convertedJar, modTarget)
+                backupDir.mkdirs()
+                moveReplace(pack, new File(backupDir, pack.name))
+                succeeded << "${pack.name} -> mods/${modTarget.name}"
+                note("Converted ${pack.name} -> mods/${modTarget.name}")
+                deleteRecursively(tempDir)
+            } else {
+                failed << "${pack.name}: ${reason}"
+                note("Failed ${pack.name}: ${reason} (tacz-temp/ kept for inspection)")
+            }
+        }
+
+        def line = '=' * 64
+        println()
+        println(line)
+        println("Version folder: ${versionDir}")
+        println()
+        println("Succeeded (${succeeded.size()}):")
+        if (succeeded.isEmpty()) {
+            println('  (none)')
+        } else {
+            succeeded.each { println("  - ${it}") }
+        }
+        println()
+        println("Failed (${failed.size()}):")
+        if (failed.isEmpty()) {
+            println('  (none)')
+        } else {
+            failed.each { println("  - ${it}") }
+        }
+        if (!skipped.isEmpty()) {
+            println()
+            println("Skipped, no gunpack.meta.json (${skipped.size()}):")
+            skipped.each { println("  - ${it}") }
+        }
+        println(line)
+    }
+}

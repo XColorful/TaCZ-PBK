@@ -631,3 +631,6 @@ tasks.named('assemble') {
 
 // 枪包迁移任务：migration.cmd 与 IDEA 的 Gradle 任务面板都通过这里执行
 apply from: 'migration.gradle'
+
+// 批量转换任务：batch_convert.cmd 与 IDEA 的 Gradle 任务面板都通过这里执行
+apply from: 'batch_convert.gradle'
