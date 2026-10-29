@@ -97,6 +97,7 @@ if (logoFile && !file(logoFile).isFile()) {
 def buildDirectory = layout.buildDirectory.get().asFile
 def generatedRoot = new File(buildDirectory, 'generated')
 def packMcmetaFile = new File(generatedRoot, 'pack.mcmeta')
+def fabricModJsonFile = new File(generatedRoot, 'fabric.mod.json')
 def metadataDir = new File(generatedRoot, 'metadata')
 def stubSourceDir = new File(generatedRoot, 'sources/stubs')
 def entrySourceDir = new File(generatedRoot, 'sources/entry')
@@ -112,12 +113,15 @@ if (classNameBase ==~ /^[0-9].*/) {
 }
 def forgeClass = classNameBase + 'Forge'
 def neoClass = classNameBase + 'Neoforge'
+def fabricClass = classNameBase + 'Fabric'
 def packagePath = javaPackage.replace('.', '/')
 
 def forgeStubFile = new File(stubSourceDir, 'net/minecraftforge/fml/common/Mod.java')
 def neoStubFile = new File(stubSourceDir, 'net/neoforged/fml/common/Mod.java')
+def fabricStubFile = new File(stubSourceDir, 'net/fabricmc/api/ModInitializer.java')
 def forgeEntryFile = new File(entrySourceDir, "${packagePath}/${forgeClass}.java")
 def neoEntryFile = new File(entrySourceDir, "${packagePath}/${neoClass}.java")
+def fabricEntryFile = new File(entrySourceDir, "${packagePath}/${fabricClass}.java")
 
 def writeUtf8 = { File file, String text ->
     file.parentFile.mkdirs()
@@ -127,8 +131,8 @@ def writeUtf8 = { File file, String text ->
 // ---------------------------------------------------------------------------
 // 入口类
 // ---------------------------------------------------------------------------
-// Forge/NeoForge 的 @Mod 注解只用于 API 编译；这里生成同名注解的桩类，
-// 编译产物里只保留两个入口类，桩类不会进入 jar（运行时由平台的注解替代）。
+// Forge/NeoForge 的 @Mod 注解、Fabric 的 ModInitializer 接口只用于 API 编译；
+// 这里生成同名的桩类，编译产物里只保留三个入口类，桩类不会进入 jar（运行时由平台的注解/接口替代）。
 tasks.register('generateEntrySources') {
     inputs.property('modId', modId)
     inputs.property('javaPackage', javaPackage)
@@ -161,8 +165,15 @@ public @interface Mod {
     String value();
 }
 ''')
+        writeUtf8(fabricStubFile, '''package net.fabricmc.api;
+
+public interface ModInitializer {
+    void onInitialize();
+}
+''')
         writeUtf8(forgeEntryFile, "package ${javaPackage};\n\n@net.minecraftforge.fml.common.Mod(\"${modId}\")\npublic class ${forgeClass} {}\n")
         writeUtf8(neoEntryFile, "package ${javaPackage};\n\n@net.neoforged.fml.common.Mod(\"${modId}\")\npublic class ${neoClass} {}\n")
+        writeUtf8(fabricEntryFile, "package ${javaPackage};\n\npublic class ${fabricClass} implements net.fabricmc.api.ModInitializer {\n    @Override\n    public void onInitialize() {\n    }\n}\n")
     }
 }
 
@@ -193,7 +204,8 @@ tasks.register('verifyEntryClasses') {
     doLast {
         def expected = [
                 new File(entryClassesDir, "${packagePath}/${forgeClass}.class"),
-                new File(entryClassesDir, "${packagePath}/${neoClass}.class")
+                new File(entryClassesDir, "${packagePath}/${neoClass}.class"),
+                new File(entryClassesDir, "${packagePath}/${fabricClass}.class")
         ]
         def found = []
         entryClassesDir.eachFileRecurse { file ->
@@ -201,8 +213,8 @@ tasks.register('verifyEntryClasses') {
                 found << file
             }
         }
-        if (found.size() != 2) {
-            throw new GradleException("Expected exactly 2 entry classes, found ${found.size()}: ${found*.name}")
+        if (found.size() != 3) {
+            throw new GradleException("Expected exactly 3 entry classes, found ${found.size()}: ${found*.name}")
         }
         expected.each { file ->
             if (!file.isFile()) {
@@ -225,11 +237,15 @@ tasks.register('verifyEntryClasses') {
         if (!neoText.contains('Lnet/neoforged/fml/common/Mod;')) {
             throw new GradleException('NeoForge entry class does not reference net.neoforged.fml.common.Mod')
         }
+        def fabricText = new String(expected[2].bytes, 'ISO-8859-1')
+        if (!fabricText.contains('net/fabricmc/api/ModInitializer')) {
+            throw new GradleException('Fabric entry class does not implement net.fabricmc.api.ModInitializer')
+        }
     }
 }
 
 // ---------------------------------------------------------------------------
-// 生成包元数据（pack.mcmeta / mods.toml / neoforge.mods.toml）
+// 生成包元数据（pack.mcmeta / mods.toml / neoforge.mods.toml / fabric.mod.json）
 // ---------------------------------------------------------------------------
 def placeholders = [
         mod_id               : modId,
@@ -247,7 +263,9 @@ def placeholders = [
         pack_format          : packFormat,
         pack_authors         : packAuthors,
         pack_date            : packDate,
-        show_as_resource_pack: showAsResourcePack
+        show_as_resource_pack: showAsResourcePack,
+        mod_group_id         : javaPackage,
+        class_name           : classNameBase
 ]
 
 def expandTemplate = { File template, Map<String, String> values ->
@@ -270,18 +288,21 @@ def stripLogoLine = { String text ->
 }
 
 tasks.register('generatePackMetadata') {
-    inputs.files(file('pack.mcmeta'), file('META-INF/mods.toml'), file('META-INF/neoforge.mods.toml'), file('gradle.properties'))
+    inputs.files(file('pack.mcmeta'), file('META-INF/mods.toml'), file('META-INF/neoforge.mods.toml'), file('fabric.mod.json'), file('gradle.properties'))
     outputs.file(packMcmetaFile)
+    outputs.file(fabricModJsonFile)
     outputs.dir(metadataDir)
     doLast {
         def packMcmeta = expandTemplate(file('pack.mcmeta'), placeholders)
         def modsToml = expandTemplate(file('META-INF/mods.toml'), placeholders)
         def neoModsToml = expandTemplate(file('META-INF/neoforge.mods.toml'), placeholders)
+        def fabricModJson = expandTemplate(file('fabric.mod.json'), placeholders)
         if (!logoFile) {
             modsToml = stripLogoLine(modsToml)
             neoModsToml = stripLogoLine(neoModsToml)
         }
         writeUtf8(packMcmetaFile, packMcmeta)
+        writeUtf8(fabricModJsonFile, fabricModJson)
         writeUtf8(new File(metadataDir, 'mods.toml'), modsToml)
         writeUtf8(new File(metadataDir, 'neoforge.mods.toml'), neoModsToml)
     }
@@ -436,13 +457,14 @@ tasks.register('stageCommon', Sync) {
 // ---------------------------------------------------------------------------
 // 产物：模组 jar、数据包、资源包、枪包 zip
 // ---------------------------------------------------------------------------
-// 模组 jar：包内容 + 两套平台元数据 + 两个入口类（桩类不打包）
+// 模组 jar：包内容 + 三套平台元数据 + 三个入口类（桩类不打包）
 tasks.named('jar', Jar) {
     dependsOn 'verifyEntryClasses', 'stageCommon'
     archiveFileName = jarFileName
     destinationDirectory.set(libsDir)
     duplicatesStrategy = DuplicatesStrategy.EXCLUDE
     from(stageCommonDir)
+    from(fabricModJsonFile)
     from(metadataDir) { into 'META-INF' }
     from(entryClassesDir) { include '**/*.class' }
     manifest {
@@ -532,21 +554,23 @@ tasks.register('verifyArtifacts') {
         [
                 'META-INF/mods.toml',
                 'META-INF/neoforge.mods.toml',
+                'fabric.mod.json',
                 'gunpack.meta.json',
                 'pack.mcmeta',
                 packagePath + '/' + forgeClass + '.class',
-                packagePath + '/' + neoClass + '.class'
+                packagePath + '/' + neoClass + '.class',
+                packagePath + '/' + fabricClass + '.class'
         ].each { required ->
             if (!(required in jarEntries)) {
                 throw new GradleException("Mod jar is missing entry: ${required}")
             }
         }
         def classEntries = jarEntries.findAll { it.endsWith('.class') }
-        if (classEntries.size() != 2) {
-            throw new GradleException("Expected exactly 2 class entries in the mod jar, found ${classEntries.size()}: ${classEntries}")
+        if (classEntries.size() != 3) {
+            throw new GradleException("Expected exactly 3 class entries in the mod jar, found ${classEntries.size()}: ${classEntries}")
         }
-        if (classEntries.any { it ==~ /^net\/(minecraftforge|neoforged)\/.*\.class$/ }) {
-            throw new GradleException("Stub @Mod classes leaked into the mod jar: ${classEntries}")
+        if (classEntries.any { it ==~ /^net\/(minecraftforge|neoforged|fabricmc)\/.*\.class$/ }) {
+            throw new GradleException("Stub classes leaked into the mod jar: ${classEntries}")
         }
 
         def datapackEntries = readEntries(datapackFile)
