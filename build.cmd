@@ -43,7 +43,7 @@ set "PATH=%JAVA_HOME%\bin;%PATH%"
 echo Using Java 17: %JAVA_HOME%
 
 pushd "%~dp0" >nul
-call "%~dp0gradlew.bat" --no-daemon --console=plain clean build %*
+call "%~dp0gradlew.bat" --no-daemon --console=plain build %*
 set "GRADLE_EXIT=%ERRORLEVEL%"
 popd
 exit /b %GRADLE_EXIT%
